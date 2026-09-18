@@ -1,6 +1,6 @@
 [package]
 name = "spoolctl"
-version = "0.1.8"
+version = "0.1.15"
 edition = "2024"
 description = "Portable tool to restart the Windows Print Spooler and clear the print queue"
 license = "MIT OR Apache-2.0"

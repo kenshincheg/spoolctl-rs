@@ -3,6 +3,8 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use windows::{
     Win32::{
@@ -23,6 +25,26 @@ static GUI_MUTEX: AtomicIsize = AtomicIsize::new(0);
 /// Returns `true` if this process owns the GUI slot.
 /// If another GUI is already running, tries to bring it to the foreground and returns `false`.
 pub fn try_acquire_gui() -> bool {
+    if try_acquire_once() {
+        return true;
+    }
+    focus_existing_gui();
+    false
+}
+
+/// Like [`try_acquire_gui`], but retries while the previous (non-elevated) process exits after UAC.
+pub fn try_acquire_gui_after_relaunch() -> bool {
+    for _ in 0..30 {
+        if try_acquire_once() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    focus_existing_gui();
+    false
+}
+
+fn try_acquire_once() -> bool {
     let name = to_wide(OsStr::new(MUTEX_NAME));
     // SAFETY: NUL-terminated name.
     let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {
@@ -33,7 +55,6 @@ pub fn try_acquire_gui() -> bool {
     let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if already {
         let _ = unsafe { CloseHandle(handle) };
-        focus_existing_gui();
         return false;
     }
 

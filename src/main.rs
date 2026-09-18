@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod elevate;
 mod gui;
 mod log;
@@ -26,17 +27,37 @@ use windows::{
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
+    if args.is_empty() || is_gui_flag(&args) {
+        let start_in_tray = is_tray_launch(&args);
+        let after_elevate = is_show_launch(&args);
         if !gui_supported() {
             notify_gui_unsupported();
             return;
         }
-        if !single_instance::try_acquire_gui() {
+        let acquired = if after_elevate {
+            single_instance::try_acquire_gui_after_relaunch()
+        } else {
+            single_instance::try_acquire_gui()
+        };
+        if !acquired {
             log::info("GUI уже запущен — активировано существующее окно");
             return;
         }
-        log::info("Запуск GUI");
-        if let Err(error) = gui::run() {
+        log::info(if start_in_tray {
+            "Запуск GUI в трее"
+        } else if after_elevate {
+            "Запуск GUI после UAC (окно на передний план)"
+        } else {
+            "Запуск GUI"
+        });
+        let result = if start_in_tray {
+            gui::run_start_in_tray()
+        } else if after_elevate {
+            gui::run_after_elevate()
+        } else {
+            gui::run()
+        };
+        if let Err(error) = result {
             log::error(&format!("Ошибка GUI: {error}"));
             single_instance::release_gui();
             notify_gui_graphics_failed(&error.to_string());
@@ -48,6 +69,24 @@ fn main() {
     ensure_cli_console();
     log::info(&format!("CLI: {}", args.join(" ")));
     run_cli(&args);
+}
+
+fn is_gui_flag(args: &[String]) -> bool {
+    is_tray_launch(args) || is_show_launch(args)
+}
+
+fn is_tray_launch(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("--tray" | "tray" | "/tray")
+    )
+}
+
+fn is_show_launch(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("--show" | "show" | "/show")
+    )
 }
 
 fn gui_supported() -> bool {
@@ -256,6 +295,7 @@ fn print_help() {
     println!();
     println!("Использование:");
     println!("  spoolctl              открыть графический интерфейс");
+    println!("  spoolctl --tray       GUI сразу в системный трей");
     println!("  spoolctl status       показать статус Spooler");
     println!("  spoolctl stop         остановить Spooler (нужен администратор)");
     println!("  spoolctl start        запустить Spooler (нужен администратор)");

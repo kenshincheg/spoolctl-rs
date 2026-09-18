@@ -3,7 +3,7 @@ REM Portable-сборка SpoolCtl: EXE + Win10/11 + папка Windows7-CLI + Z
 setlocal EnableExtensions
 cd /d "%~dp0.."
 
-set "VERSION=0.1.8"
+set "VERSION=0.1.15"
 set "CARGO_TARGET_DIR=E:\cargo-target\spoolctl-rs"
 set "STAGE=dist\stage\SpoolCtl-%VERSION%"
 set "ZIP=dist\SpoolCtl-%VERSION%-win64.zip"

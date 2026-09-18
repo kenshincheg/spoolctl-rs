@@ -15,7 +15,7 @@ Portable Rust-утилита для службы печати Windows (**Spooler
 
 ## Статус
 
-**0.1.8**: трей показать/выход/повторный запуск; компактное окно.
+**0.1.15** (стабильный): автозапуск elevated, трей, сторож, компактный UI с иконками действий.
 
 ## Сборка portable
 
@@ -27,9 +27,9 @@ tools\build-portable.cmd
 
 Результат:
 
-- `dist\stage\SpoolCtl-0.1.8\` — готовая папка (Win10/11 + `Windows7-CLI`)
-- `dist\SpoolCtl-0.1.8-win64.zip`
-- `dist\SpoolCtl-0.1.8-win64.zip.sha256`
+- `dist\stage\SpoolCtl-0.1.15\` — готовая папка (Win10/11 + `Windows7-CLI`)
+- `dist\SpoolCtl-0.1.15-win64.zip`
+- `dist\SpoolCtl-0.1.15-win64.zip.sha256`
 
 Заметки релиза: [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
 

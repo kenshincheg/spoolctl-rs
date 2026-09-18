@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, FontId, RichText, TextStyle, Theme, ThemePreference, Visuals};
 
+use crate::autostart;
 use crate::elevate;
 use crate::log;
 use crate::ncd;
@@ -59,21 +60,21 @@ impl Palette {
                 tip_text: Color32::from_rgb(235, 244, 255),
             }
         } else {
-            // Soft daylight blues (kept from previous look).
+            // Soft daylight blues — lighter main canvas.
             Self {
-                bg: Color32::from_rgb(230, 242, 255),
-                panel: Color32::from_rgb(214, 234, 252),
+                bg: Color32::from_rgb(245, 250, 255),
+                panel: Color32::from_rgb(236, 245, 255),
                 text: Color32::from_rgb(18, 52, 86),
                 accent: Color32::from_rgb(37, 99, 160),
                 accent_hover: Color32::from_rgb(56, 130, 200),
                 accent_active: Color32::from_rgb(25, 80, 140),
                 on_accent: Color32::from_rgb(245, 250, 255),
-                soft_btn: Color32::from_rgb(190, 220, 245),
+                soft_btn: Color32::from_rgb(210, 230, 248),
                 util_btn: Color32::from_rgb(56, 142, 100),
                 on_util: Color32::from_rgb(245, 255, 248),
                 error: Color32::from_rgb(170, 35, 45),
                 ok: Color32::from_rgb(20, 110, 60),
-                tip_bg: Color32::from_rgb(245, 250, 255),
+                tip_bg: Color32::from_rgb(252, 254, 255),
                 tip_text: Color32::from_rgb(18, 52, 86),
             }
         }
@@ -96,6 +97,10 @@ enum Confirm {
     DisableNcd,
     /// Explicit consent before enabling auto-restart on hang.
     EnableAutoRestart,
+    /// Explicit consent before enabling Windows login autostart.
+    EnableAutostart,
+    /// Close button (X): ask tray vs exit.
+    CloseOrTray,
 }
 
 enum JobResult {
@@ -132,10 +137,16 @@ pub struct SpoolCtlApp {
     /// Real exit (from tray «Выход»); otherwise close hides to tray.
     allow_exit: bool,
     window_in_tray: bool,
+    /// Hide to tray once after startup (`--tray` / Windows autostart).
+    start_in_tray: bool,
+    /// After UAC (`--show`): force the window visible on first frame.
+    force_show_window: bool,
+    /// Mirrors HKCU Run key for SpoolCtl.
+    autostart_enabled: bool,
 }
 
 impl SpoolCtlApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, start_in_tray: bool, force_show_window: bool) -> Self {
         apply_theme(&cc.egui_ctx);
         let elevated = elevate::is_elevated();
         log::info(&format!(
@@ -165,6 +176,9 @@ impl SpoolCtlApp {
             tray: None,
             allow_exit: false,
             window_in_tray: false,
+            start_in_tray,
+            force_show_window: force_show_window && !start_in_tray,
+            autostart_enabled: autostart::is_enabled(),
         };
         tray::remember_main_hwnd_from_cc(cc);
         match AppTray::install(APP_VERSION) {
@@ -470,6 +484,8 @@ impl SpoolCtlApp {
 
     fn request_admin_relaunch(&mut self) {
         log::info("Запрос запуска от имени администратора");
+        // Tear down tray host first so the elevated copy does not activate us / inherit a hidden state.
+        self.tray = None;
         // Release single-instance mutex first; otherwise the elevated copy sees
         // this process still holding it, "activates" this closing window, and exits.
         single_instance::release_gui();
@@ -482,10 +498,110 @@ impl SpoolCtlApp {
                 log::error(&error);
                 // UAC cancelled or failed — take the GUI slot again if possible.
                 let _ = single_instance::try_acquire_gui();
+                // Tray was dropped above; reinstall so watchdog balloon still works.
+                match tray::AppTray::install(APP_VERSION) {
+                    Ok(tray) => self.tray = Some(tray),
+                    Err(tray_err) => log::warn(&format!("Трей после отмены UAC: {tray_err}")),
+                }
                 self.message = error;
                 self.message_is_error = true;
                 self.refresh_log_view();
             }
+        }
+    }
+
+    fn draw_service_actions(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let gap = 8.0;
+        let height = 72.0;
+        let row_width = ui.available_width();
+        let width = ((row_width - gap * 2.0) / 3.0).clamp(100.0, 220.0);
+        let size = egui::vec2(width, height);
+
+        let (start_fill, start_text) = if self.prompt_start {
+            (p.accent, p.on_accent)
+        } else {
+            (p.soft_btn, p.text)
+        };
+        let start_tip = if self.prompt_start {
+            "Spooler остановлен. Нажмите, чтобы снова запустить службу печати."
+        } else {
+            "Запускает службу Spooler, если она остановлена. Обычно нужны права администратора."
+        };
+
+        // Row 1 — управление службой; row 2 — статус и очередь.
+        let rows = [
+            [
+                (
+                    ServiceIcon::Start,
+                    "Старт",
+                    start_tip,
+                    start_fill,
+                    start_text,
+                    ActionClick::Job(Job::Start),
+                ),
+                (
+                    ServiceIcon::Stop,
+                    "Стоп",
+                    "Останавливает службу Spooler. Печать станет недоступна, пока службу не запустят снова.",
+                    p.soft_btn,
+                    p.text,
+                    ActionClick::Confirm(Job::Stop),
+                ),
+                (
+                    ServiceIcon::Restart,
+                    "Перезапуск",
+                    "Останавливает и снова запускает службу печати. Помогает при зависании очереди. Нужны права администратора.",
+                    p.accent_active,
+                    p.on_accent,
+                    ActionClick::Confirm(Job::Restart),
+                ),
+            ],
+            [
+                (
+                    ServiceIcon::Refresh,
+                    "Обновить",
+                    "Запрашивает текущее состояние службы печати Spooler без изменений.",
+                    p.soft_btn,
+                    p.text,
+                    ActionClick::Job(Job::Refresh),
+                ),
+                (
+                    ServiceIcon::Clear,
+                    "Очистить",
+                    "Останавливает Spooler и удаляет файлы заданий в spool\\PRINTERS. Службу нужно запустить отдельно.",
+                    p.soft_btn,
+                    p.text,
+                    ActionClick::Confirm(Job::ClearOnly),
+                ),
+                (
+                    ServiceIcon::ClearRestart,
+                    "Очист.+старт",
+                    "Останавливает Spooler, удаляет файлы заданий в spool\\PRINTERS, затем запускает службу снова. Удалит текущие задания печати.",
+                    p.accent,
+                    p.on_accent,
+                    ActionClick::Confirm(Job::FixClear),
+                ),
+            ],
+        ];
+
+        for (row_idx, row) in rows.into_iter().enumerate() {
+            if row_idx > 0 {
+                ui.add_space(gap);
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                for (i, (icon, label, tip, fill, text_color, click)) in row.into_iter().enumerate()
+                {
+                    if i > 0 {
+                        ui.add_space(gap);
+                    }
+                    if themed_action_tile(ui, size, icon, label, tip, fill, text_color) {
+                        match click {
+                            ActionClick::Job(job) => self.start_job(job),
+                            ActionClick::Confirm(job) => self.confirm = Some(Confirm::Job(job)),
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -658,6 +774,61 @@ impl SpoolCtlApp {
                     .color(p.accent),
                 );
             }
+
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Автозапуск Windows")
+                    .size(15.0)
+                    .strong()
+                    .color(p.text),
+            );
+            let mut boot = self.autostart_enabled;
+            let boot_resp = ui.checkbox(
+                &mut boot,
+                "Запускать при входе в Windows (в трее, с правами администратора)",
+            );
+            if boot_resp.changed() {
+                if boot {
+                    self.autostart_enabled = false;
+                    self.confirm = Some(Confirm::EnableAutostart);
+                } else {
+                    match autostart::disable() {
+                        Ok(()) => {
+                            self.autostart_enabled = false;
+                            log::info("Автозапуск с Windows: выкл");
+                            self.message = "Автозапуск при входе выключен.".to_owned();
+                            self.message_is_error = false;
+                        }
+                        Err(error) => {
+                            log::error(&format!("Автозапуск: {error}"));
+                            self.message = error;
+                            self.message_is_error = true;
+                            self.autostart_enabled = autostart::is_enabled();
+                        }
+                    }
+                    self.refresh_log_view();
+                }
+            }
+            boot_resp.on_hover_text(
+                "Задача Планировщика с наивысшими правами: после reboot SpoolCtl стартует в трее уже elevated (для учёток из группы Администраторы). Включение — один раз от имени администратора.",
+            );
+            if self.autostart_enabled {
+                ui.label(
+                    RichText::new(
+                        "При входе: старт в трее с правами администратора (Планировщик).",
+                    )
+                    .size(13.0)
+                    .color(p.ok),
+                );
+            } else if !self.elevated {
+                ui.label(
+                    RichText::new(
+                        "Чтобы включить elevated-автозапуск — откройте программу от имени администратора.",
+                    )
+                    .size(13.0)
+                    .color(p.accent),
+                );
+            }
         });
     }
 
@@ -717,6 +888,19 @@ impl SpoolCtlApp {
 
 impl eframe::App for SpoolCtlApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.start_in_tray && self.tray.is_some() {
+            self.start_in_tray = false;
+            log::info("Старт в трее (--tray)");
+            self.hide_to_tray();
+        } else if self.force_show_window {
+            // After UAC relaunch (`--show`) always bring the window forward — never stay in tray.
+            self.force_show_window = false;
+            tray::show_main_window();
+            self.window_in_tray = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            log::info("Окно показано после запуска от администратора");
+        }
+
         self.poll_tray(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -727,7 +911,10 @@ impl eframe::App for SpoolCtlApp {
                 // Let the window close and the process exit.
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide_to_tray();
+                // Ask once; don't stack dialogs if already open.
+                if !matches!(self.confirm, Some(Confirm::CloseOrTray)) {
+                    self.confirm = Some(Confirm::CloseOrTray);
+                }
             }
         }
 
@@ -841,6 +1028,17 @@ impl eframe::App for SpoolCtlApp {
                                 .color(p.error)
                                 .strong(),
                         );
+                        ui.add_space(10.0);
+                        if themed_button_bar(
+                            ui,
+                            [168.0, 30.0],
+                            "От админа",
+                            "Откроет окно UAC и перезапустит SpoolCtl с правами администратора. Нужно для остановки и перезапуска службы.",
+                            p.accent,
+                            p.on_accent,
+                        ) {
+                            self.request_admin_relaunch();
+                        }
                     }
                 });
 
@@ -869,122 +1067,7 @@ impl eframe::App for SpoolCtlApp {
                 ui.add_space(10.0);
 
                 ui.add_enabled_ui(!self.busy, |ui| {
-                    if !self.elevated
-                        && themed_button(
-                            ui,
-                            "Запустить от имени администратора",
-                            "Откроет окно UAC и перезапустит SpoolCtl с правами администратора. Нужно для остановки и перезапуска службы.",
-                            p.accent,
-                            p.on_accent,
-                            40.0,
-                            true,
-                        )
-                        .clicked()
-                    {
-                        self.request_admin_relaunch();
-                    }
-                    if !self.elevated {
-                        ui.add_space(10.0);
-                    }
-
-                    if themed_button(
-                        ui,
-                        "Обновить статус службы",
-                        "Запрашивает текущее состояние службы печати Spooler без изменений.",
-                        p.soft_btn,
-                        p.text,
-                        40.0,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.start_job(Job::Refresh);
-                    }
-
-                    ui.add_space(8.0);
-                    let (start_fill, start_text) = if self.prompt_start {
-                        (p.accent, p.on_accent)
-                    } else {
-                        (p.soft_btn, p.text)
-                    };
-                    let start_tip = if self.prompt_start {
-                        "Spooler остановлен. Нажмите, чтобы снова запустить службу печати."
-                    } else {
-                        "Запускает службу Spooler, если она остановлена. Обычно нужны права администратора."
-                    };
-                    if themed_button(
-                        ui,
-                        "Запустить службу",
-                        start_tip,
-                        start_fill,
-                        start_text,
-                        40.0,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.start_job(Job::Start);
-                    }
-
-                    ui.add_space(8.0);
-                    if themed_button(
-                        ui,
-                        "Остановить службу",
-                        "Останавливает службу Spooler. Печать станет недоступна, пока службу не запустят снова.",
-                        p.soft_btn,
-                        p.text,
-                        40.0,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.confirm = Some(Confirm::Job(Job::Stop));
-                    }
-
-                    ui.add_space(8.0);
-                    if themed_button(
-                        ui,
-                        "Перезапустить службу",
-                        "Останавливает и снова запускает службу печати. Помогает при зависании очереди. Нужны права администратора.",
-                        p.accent_active,
-                        p.on_accent,
-                        42.0,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.confirm = Some(Confirm::Job(Job::Restart));
-                    }
-
-                    ui.add_space(8.0);
-                    if themed_button(
-                        ui,
-                        "Очистить очередь печати",
-                        "Останавливает Spooler и удаляет файлы заданий в spool\\PRINTERS. Службу нужно запустить отдельно.",
-                        p.soft_btn,
-                        p.text,
-                        44.0,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.confirm = Some(Confirm::Job(Job::ClearOnly));
-                    }
-
-                    ui.add_space(8.0);
-                    if themed_button(
-                        ui,
-                        "Очистить очередь печати и перезапустить службу",
-                        "Останавливает Spooler, удаляет файлы заданий в spool\\PRINTERS, затем запускает службу снова. Удалит текущие задания печати.",
-                        p.accent,
-                        p.on_accent,
-                        48.0,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.confirm = Some(Confirm::Job(Job::FixClear));
-                    }
+                    self.draw_service_actions(ui, p);
                 });
 
                 if self.busy {
@@ -1047,6 +1130,66 @@ impl eframe::App for SpoolCtlApp {
             });
 
         if let Some(confirm) = self.confirm {
+            if matches!(confirm, Confirm::CloseOrTray) {
+                egui::Window::new(
+                    RichText::new("Закрыть окно?")
+                        .size(18.0)
+                        .color(p.text)
+                        .strong(),
+                )
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(egui::Frame::window(ui.style()).fill(p.bg))
+                .show(ui.ctx(), |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Свернуть в трей (сторож продолжит работу) или полностью закрыть программу?",
+                        )
+                        .size(16.0)
+                        .color(p.text),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if themed_button_bar(
+                            ui,
+                            [160.0, 34.0],
+                            "Отмена",
+                            "Оставить окно открытым.",
+                            p.soft_btn,
+                            p.text,
+                        ) {
+                            self.confirm = None;
+                        }
+                        if themed_button_bar(
+                            ui,
+                            [160.0, 34.0],
+                            "В трей",
+                            "Скрыть окно; процесс и сторож продолжат работу.",
+                            p.accent,
+                            p.on_accent,
+                        ) {
+                            self.confirm = None;
+                            self.hide_to_tray();
+                        }
+                        if themed_button_bar(
+                            ui,
+                            [160.0, 34.0],
+                            "Закрыть программу",
+                            "Полностью выйти из SpoolCtl.",
+                            p.accent,
+                            p.on_accent,
+                        ) {
+                            self.confirm = None;
+                            self.allow_exit = true;
+                            log::info("Выход по выбору пользователя (закрыть программу)");
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+                return;
+            }
+
             let (title, body) = match confirm {
                 Confirm::Job(Job::Stop) => (
                     "Остановить службу?",
@@ -1073,6 +1216,11 @@ impl eframe::App for SpoolCtlApp {
                     "Включить автоперезапуск при зависании?",
                     "ВНИМАНИЕ: при подозрении на зависание очереди (задания без прогресса ~90 с) или застревании службы Spooler будет перезапущен автоматически. Текущая печать может прерваться. Ложные срабатывания возможны на медленных принтерах. Нужны права администратора. Можно отключить галочкой в любой момент.",
                 ),
+                Confirm::EnableAutostart => (
+                    "Автозапуск с правами администратора?",
+                    "Будет создана задача Планировщика Windows: при вашем входе SpoolCtl стартует в трее уже с повышенными правами (без повторного UAC), чтобы автоперезапуск Spooler работал после reboot. Нужна учётка из группы «Администраторы». Включение — один раз из окна администратора. Старая запись HKCU\\Run будет убрана.",
+                ),
+                Confirm::CloseOrTray => unreachable!(),
             };
 
             egui::Window::new(RichText::new(title).size(18.0).color(p.text).strong())
@@ -1140,6 +1288,28 @@ impl eframe::App for SpoolCtlApp {
                                     self.message_is_error = false;
                                     self.refresh_log_view();
                                 }
+                                Confirm::EnableAutostart => {
+                                    match autostart::enable() {
+                                        Ok(()) => {
+                                            self.autostart_enabled = true;
+                                            log::info(
+                                                "Автозапуск: задача Планировщика /RL HIGHEST (явное согласие)",
+                                            );
+                                            self.message =
+                                                "Автозапуск включён: после входа — в трее с правами администратора."
+                                                    .to_owned();
+                                            self.message_is_error = false;
+                                        }
+                                        Err(error) => {
+                                            self.autostart_enabled = false;
+                                            log::error(&format!("Автозапуск: {error}"));
+                                            self.message = error;
+                                            self.message_is_error = true;
+                                        }
+                                    }
+                                    self.refresh_log_view();
+                                }
+                                Confirm::CloseOrTray => unreachable!(),
                             }
                         }
                     });
@@ -1149,6 +1319,23 @@ impl eframe::App for SpoolCtlApp {
 }
 
 const BUTTON_FONT_SIZE: f32 = 16.0;
+/// Soft rounded corners for all action / util / dialog buttons.
+const BUTTON_CORNER: f32 = 10.0;
+
+#[derive(Clone, Copy)]
+enum ServiceIcon {
+    Refresh,
+    Start,
+    Stop,
+    Restart,
+    Clear,
+    ClearRestart,
+}
+
+enum ActionClick {
+    Job(Job),
+    Confirm(Job),
+}
 
 fn jobs_phrase_ui(n: usize) -> String {
     let n10 = n % 10;
@@ -1162,26 +1349,6 @@ fn jobs_phrase_ui(n: usize) -> String {
     } else {
         format!("{n} заданий")
     }
-}
-
-fn themed_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    tip: &str,
-    fill: Color32,
-    text_color: Color32,
-    height: f32,
-    bold: bool,
-) -> egui::Response {
-    themed_button_sized(
-        ui,
-        [ui.available_width(), height],
-        label,
-        tip,
-        fill,
-        text_color,
-        bold,
-    )
 }
 
 fn themed_button_sized(
@@ -1208,6 +1375,7 @@ fn themed_button_sized(
         size,
         egui::Button::new(text)
             .fill(fill)
+            .corner_radius(BUTTON_CORNER)
             .wrap_mode(egui::TextWrapMode::Wrap),
     )
     .on_hover_text(
@@ -1239,6 +1407,7 @@ fn themed_button_bar(
         size,
         egui::Button::new(text)
             .fill(fill)
+            .corner_radius(BUTTON_CORNER)
             .wrap_mode(egui::TextWrapMode::Truncate),
     )
     .on_hover_text(
@@ -1247,6 +1416,180 @@ fn themed_button_bar(
             .color(tip_color),
     )
     .clicked()
+}
+
+/// Compact service action: icon on top, short label below.
+fn themed_action_tile(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    icon: ServiceIcon,
+    label: &str,
+    tip: &str,
+    fill: Color32,
+    text_color: Color32,
+) -> bool {
+    let tip_color = if ui.visuals().dark_mode {
+        Color32::from_rgb(235, 244, 255)
+    } else {
+        Color32::from_rgb(18, 52, 86)
+    };
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let bg = if response.hovered() || response.has_focus() {
+        visuals.bg_fill
+    } else {
+        fill
+    };
+    let radius = egui::CornerRadius::same(BUTTON_CORNER as u8);
+    ui.painter().rect_filled(rect, radius, bg);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, visuals.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + size.y * 0.34),
+        egui::vec2(size.x * 0.42, size.y * 0.34),
+    );
+    paint_service_icon(ui.painter(), icon_rect, icon, text_color);
+
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - 14.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(13.0),
+        text_color,
+    );
+
+    response
+        .on_hover_text(
+            RichText::new(tip)
+                .font(FontId::proportional(BUTTON_FONT_SIZE))
+                .color(tip_color),
+        )
+        .clicked()
+}
+
+fn paint_service_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: ServiceIcon,
+    color: Color32,
+) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.5;
+    let stroke = egui::Stroke::new(2.2, color);
+
+    match icon {
+        ServiceIcon::Refresh => {
+            let r = s * 0.72;
+            painter.circle_stroke(c, r, stroke);
+            let tip = c + egui::vec2(r * 0.15, -r);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    tip + egui::vec2(-5.0, 2.0),
+                    tip + egui::vec2(5.0, 2.0),
+                    tip + egui::vec2(0.0, -6.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        ServiceIcon::Start => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(-s * 0.45, -s * 0.7),
+                    c + egui::vec2(s * 0.75, 0.0),
+                    c + egui::vec2(-s * 0.45, s * 0.7),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        ServiceIcon::Stop => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(c, egui::vec2(s * 1.15, s * 1.15)),
+                2.0,
+                color,
+            );
+        }
+        ServiceIcon::Restart => {
+            let r = s * 0.7;
+            painter.circle_stroke(c, r, stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(r * 0.2, -r),
+                    c + egui::vec2(r * 0.95, -r * 0.35),
+                    c + egui::vec2(r * 0.05, -r * 0.25),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.line_segment(
+                [
+                    c + egui::vec2(-r * 0.15, r * 0.85),
+                    c + egui::vec2(r * 0.55, r * 0.35),
+                ],
+                stroke,
+            );
+        }
+        ServiceIcon::Clear => {
+            painter.line_segment(
+                [
+                    c + egui::vec2(-s * 0.55, -s * 0.55),
+                    c + egui::vec2(s * 0.55, -s * 0.55),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    c + egui::vec2(-s * 0.2, -s * 0.75),
+                    c + egui::vec2(s * 0.2, -s * 0.75),
+                ],
+                stroke,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    c + egui::vec2(-s * 0.45, -s * 0.4),
+                    c + egui::vec2(s * 0.45, s * 0.75),
+                ),
+                2.0,
+                stroke,
+                egui::StrokeKind::Outside,
+            );
+            painter.line_segment(
+                [c + egui::vec2(0.0, -s * 0.15), c + egui::vec2(0.0, s * 0.5)],
+                stroke,
+            );
+        }
+        ServiceIcon::ClearRestart => {
+            painter.line_segment(
+                [
+                    c + egui::vec2(-s * 0.85, -s * 0.55),
+                    c + egui::vec2(-s * 0.15, s * 0.15),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    c + egui::vec2(-s * 0.15, -s * 0.55),
+                    c + egui::vec2(-s * 0.85, s * 0.15),
+                ],
+                stroke,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(s * 0.05, -s * 0.45),
+                    c + egui::vec2(s * 0.9, s * 0.15),
+                    c + egui::vec2(s * 0.05, s * 0.75),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
 }
 
 fn apply_fonts(style: &mut egui::Style) {
@@ -1284,15 +1627,22 @@ fn soft_visuals(dark: bool) -> Visuals {
     visuals.override_text_color = Some(p.text);
     visuals.widgets.noninteractive.bg_fill = p.panel;
     visuals.widgets.noninteractive.fg_stroke.color = p.text;
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(BUTTON_CORNER as u8);
     visuals.widgets.inactive.bg_fill = p.soft_btn;
     visuals.widgets.inactive.weak_bg_fill = p.soft_btn;
     visuals.widgets.inactive.fg_stroke.color = p.text;
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(BUTTON_CORNER as u8);
     visuals.widgets.hovered.bg_fill = p.accent_hover;
     visuals.widgets.hovered.weak_bg_fill = p.accent_hover;
     visuals.widgets.hovered.fg_stroke.color = p.on_accent;
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(BUTTON_CORNER as u8);
     visuals.widgets.active.bg_fill = p.accent_active;
     visuals.widgets.active.weak_bg_fill = p.accent_active;
     visuals.widgets.active.fg_stroke.color = p.on_accent;
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(BUTTON_CORNER as u8);
+    visuals.widgets.open.corner_radius = egui::CornerRadius::same(BUTTON_CORNER as u8);
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
     visuals.selection.bg_fill = p.accent.gamma_multiply(0.45);
     visuals.hyperlink_color = p.accent;
     visuals.faint_bg_color = p.bg;
@@ -1341,14 +1691,27 @@ fn done_message(label: &str) -> String {
 }
 
 pub fn run() -> eframe::Result {
-    // Prefer OpenGL (Glow); many Win10 PCs with broken/outdated GL drivers need DirectX via wgpu.
-    match run_with_renderer(eframe::Renderer::Glow) {
+    run_inner(false, false)
+}
+
+/// Start GUI and immediately hide to tray (Windows autostart / `--tray`).
+pub fn run_start_in_tray() -> eframe::Result {
+    run_inner(true, false)
+}
+
+/// Start GUI visible after UAC relaunch (`--show`).
+pub fn run_after_elevate() -> eframe::Result {
+    run_inner(false, true)
+}
+
+fn run_inner(start_in_tray: bool, force_show_window: bool) -> eframe::Result {
+    match run_with_renderer(eframe::Renderer::Glow, start_in_tray, force_show_window) {
         Ok(()) => Ok(()),
         Err(glow_err) => {
             log::warn(&format!(
                 "OpenGL (Glow) недоступен: {glow_err}; пробуем DirectX/Vulkan (wgpu)"
             ));
-            match run_with_renderer(eframe::Renderer::Wgpu) {
+            match run_with_renderer(eframe::Renderer::Wgpu, start_in_tray, force_show_window) {
                 Ok(()) => Ok(()),
                 Err(wgpu_err) => {
                     log::error(&format!("wgpu тоже не запустился: {wgpu_err}"));
@@ -1359,7 +1722,11 @@ pub fn run() -> eframe::Result {
     }
 }
 
-fn run_with_renderer(renderer: eframe::Renderer) -> eframe::Result {
+fn run_with_renderer(
+    renderer: eframe::Renderer,
+    start_in_tray: bool,
+    force_show_window: bool,
+) -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/printer-icon.png")).ok();
 
     let elevated = elevate::is_elevated();
@@ -1369,8 +1736,8 @@ fn run_with_renderer(renderer: eframe::Renderer) -> eframe::Result {
         format!("SpoolCtl {APP_VERSION}")
     };
 
-    // Compact start height: up to «Очистить очередь… и перезапустить»; остальное — скролл.
-    let start_h = if elevated { 640.0 } else { 700.0 };
+    // Compact start: header + watchdog + two action rows; rest scrolls.
+    let start_h = if elevated { 620.0 } else { 660.0 };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1080.0, start_h])
@@ -1395,6 +1762,6 @@ fn run_with_renderer(renderer: eframe::Renderer) -> eframe::Result {
     eframe::run_native(
         "SpoolCtl",
         options,
-        Box::new(|cc| Ok(Box::new(SpoolCtlApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(SpoolCtlApp::new(cc, start_in_tray, force_show_window)))),
     )
 }

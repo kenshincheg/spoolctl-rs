@@ -47,7 +47,8 @@ fn query_elevated() -> Result<bool, String> {
     elevated
 }
 
-/// Relaunches this EXE via UAC (`runas`). Caller should exit on success.
+/// Relaunches this EXE via UAC (`runas`) with `--show` so the new window stays visible.
+/// Caller should exit on success.
 pub fn relaunch_elevated() -> Result<(), String> {
     if is_elevated() {
         return Err("Уже запущено с правами администратора.".to_owned());
@@ -56,6 +57,8 @@ pub fn relaunch_elevated() -> Result<(), String> {
     let exe = env::current_exe().map_err(|err| format!("Не удалось найти путь к EXE: {err}"))?;
     let exe_wide = to_wide(exe.as_os_str());
     let verb = to_wide(OsStr::new("runas"));
+    // Explicit flag: never inherit a prior `--tray` launch into the elevated copy.
+    let params = to_wide(OsStr::new("--show"));
 
     // SAFETY: NUL-terminated wide strings; ShellExecuteW does not take ownership.
     let result = unsafe {
@@ -63,7 +66,7 @@ pub fn relaunch_elevated() -> Result<(), String> {
             None,
             PCWSTR(verb.as_ptr()),
             PCWSTR(exe_wide.as_ptr()),
-            PCWSTR::null(),
+            PCWSTR(params.as_ptr()),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         )
