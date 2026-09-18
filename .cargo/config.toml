@@ -1,0 +1,3 @@
+# Build artifacts on a local disk (not Google Drive / «Мой диск»).
+[build]
+target-dir = "E:/cargo-target/spoolctl-rs"
