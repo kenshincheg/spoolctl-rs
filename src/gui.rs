@@ -8,9 +8,10 @@ use eframe::egui::{self, Color32, FontId, RichText, TextStyle, Theme, ThemePrefe
 
 use crate::autostart;
 use crate::elevate;
+use crate::host::Host;
 use crate::log;
 use crate::ncd;
-use crate::queue::{self, ClearReport, PrinterEntry};
+use crate::queue::{self, ClearReport, PrinterEntry, QueueSnapshot};
 use crate::single_instance;
 use crate::spooler::{self, SpoolerStatus};
 use crate::tray::{self, AppTray, TrayCmd};
@@ -108,6 +109,8 @@ enum JobResult {
         label: &'static str,
         status: SpoolerStatus,
         report: Option<ClearReport>,
+        /// Fetched on worker thread — never touch remote SCM/ADMIN$ on the UI thread.
+        snap: QueueSnapshot,
     },
     Failed {
         label: &'static str,
@@ -143,6 +146,12 @@ pub struct SpoolCtlApp {
     force_show_window: bool,
     /// Mirrors HKCU Run key for SpoolCtl.
     autostart_enabled: bool,
+    /// Text field for remote PC (empty = this computer).
+    host_input: String,
+    /// Parsed target for jobs / status.
+    host: Host,
+    /// Typewriter tooltip on «От админа»: when hover started.
+    admin_tip_started: Option<Instant>,
 }
 
 impl SpoolCtlApp {
@@ -179,6 +188,9 @@ impl SpoolCtlApp {
             start_in_tray,
             force_show_window: force_show_window && !start_in_tray,
             autostart_enabled: autostart::is_enabled(),
+            host_input: String::new(),
+            host: Host::local(),
+            admin_tip_started: None,
         };
         tray::remember_main_hwnd_from_cc(cc);
         match AppTray::install(APP_VERSION) {
@@ -199,7 +211,7 @@ impl SpoolCtlApp {
             log::info("Сторож зависания: автоперезапуск включён");
         }
         app.refresh_log_view();
-        app.apply_status_query();
+        app.apply_status_query_local();
         app
     }
 
@@ -212,27 +224,69 @@ impl SpoolCtlApp {
     }
 
     fn refresh_queue_line(&mut self) {
-        let snap = queue::queue_snapshot();
+        // Local only — remote queue enumeration can hang the UI for minutes.
+        if !self.host.is_local() {
+            return;
+        }
+        let snap = queue::queue_snapshot_on(&self.host);
+        self.apply_queue_snap(snap);
+    }
+
+    fn apply_queue_snap(&mut self, snap: QueueSnapshot) {
         self.queue_line = snap.line_ru();
         self.printers = snap.printers;
     }
 
-    fn apply_status(&mut self, status: &SpoolerStatus) {
-        self.status_line = format_status(status);
+    fn apply_status_fields(&mut self, status: &SpoolerStatus) {
+        let where_ = self.host.label_ru();
+        self.status_line = format!("{} — {where_}", format_status(status));
         self.prompt_start = status.state == spooler::ServiceState::Stopped;
         self.last_service_state = Some(status.state);
-        self.refresh_queue_line();
     }
 
     /// Quiet status poll for the idle timer (does not touch the message line).
     fn quiet_status_refresh(&mut self) {
-        if let Ok(status) = spooler::query_spooler_status() {
-            self.apply_status(&status);
+        self.last_auto_status = Instant::now();
+        // Remote SCM/RPC timeouts block for a long time — never poll remote on the UI thread.
+        if !self.host.is_local() {
+            return;
+        }
+        if let Ok(status) = spooler::query_spooler_status_on(&self.host) {
+            self.apply_status_fields(&status);
+            self.refresh_queue_line();
         } else {
             self.refresh_queue_line();
         }
-        self.last_auto_status = Instant::now();
         self.run_watchdog_tick();
+    }
+
+    /// Parse the host field into `self.host`. Returns whether the target changed.
+    fn sync_host_from_input(&mut self) -> Result<bool, String> {
+        let host = Host::parse(&self.host_input)?;
+        let changed = host != self.host;
+        self.host = host;
+        Ok(changed)
+    }
+
+    fn apply_host_input(&mut self) {
+        match self.sync_host_from_input() {
+            Ok(changed) => {
+                if changed {
+                    log::info(&format!("Цель: {}", self.host.label_ru()));
+                }
+                // Always refresh on Apply — remote work must be async.
+                if self.host.is_local() {
+                    self.apply_status_query_local();
+                    self.refresh_log_view();
+                } else if !self.busy {
+                    self.start_job(Job::Refresh);
+                }
+            }
+            Err(error) => {
+                self.message = error;
+                self.message_is_error = true;
+            }
+        }
     }
 
     fn run_watchdog_tick(&mut self) {
@@ -293,16 +347,16 @@ impl SpoolCtlApp {
         }
     }
 
-    fn apply_status_query(&mut self) {
-        match spooler::query_spooler_status() {
+    fn apply_status_query_local(&mut self) {
+        match spooler::query_spooler_status_on(&self.host) {
             Ok(status) => {
-                self.apply_status(&status);
-                self.message = "Статус обновлён.".to_owned();
+                self.apply_status_fields(&status);
+                self.refresh_queue_line();
+                self.message = format!("Статус обновлён ({}).", self.host.label_ru());
                 self.message_is_error = false;
             }
             Err(error) => {
-                self.status_line = "служба печати недоступна".to_owned();
-                self.refresh_queue_line();
+                self.status_line = format!("служба печати недоступна — {}", self.host.label_ru());
                 self.message = error;
                 self.message_is_error = true;
             }
@@ -314,86 +368,79 @@ impl SpoolCtlApp {
             log::warn("Повторный запуск операции проигнорирован: уже выполняется");
             return;
         }
+        if let Err(error) = self.sync_host_from_input() {
+            self.message = error;
+            self.message_is_error = true;
+            return;
+        }
         self.busy = true;
         self.message_is_error = false;
+        let where_ = self.host.label_ru();
         self.message = match job {
-            Job::Refresh => "Обновление статуса…",
-            Job::Stop => "Остановка Spooler…",
-            Job::Start => "Запуск Spooler…",
-            Job::Restart => "Перезапуск Spooler…",
-            Job::ClearOnly => "Очистка очереди…",
-            Job::FixClear => "Очистка очереди и перезапуск…",
-        }
-        .to_owned();
+            Job::Refresh => format!("Обновление статуса ({where_})…"),
+            Job::Stop => format!("Остановка Spooler ({where_})…"),
+            Job::Start => format!("Запуск Spooler ({where_})…"),
+            Job::Restart => format!("Перезапуск Spooler ({where_})…"),
+            Job::ClearOnly => format!("Очистка очереди ({where_})…"),
+            Job::FixClear => format!("Очистка очереди и перезапуск ({where_})…"),
+        };
         log::info(&format!("{}: начало", self.message.trim_end_matches('…')));
 
         let (tx, rx) = mpsc::channel();
         self.result_rx = Some(rx);
+        let host = self.host.clone();
 
         thread::spawn(move || {
             let timeout = spooler::DEFAULT_CONTROL_TIMEOUT;
+            let pack = |label: &'static str,
+                        status: SpoolerStatus,
+                        report: Option<ClearReport>| {
+                let snap = queue::queue_snapshot_on(&host);
+                JobResult::Done {
+                    label,
+                    status,
+                    report,
+                    snap,
+                }
+            };
             let result = match job {
-                Job::Refresh => match spooler::query_spooler_status() {
-                    Ok(status) => JobResult::Done {
-                        label: "Обновление",
-                        status,
-                        report: None,
-                    },
+                Job::Refresh => match spooler::query_spooler_status_on(&host) {
+                    Ok(status) => pack("Обновление", status, None),
                     Err(error) => JobResult::Failed {
                         label: "Обновление",
                         error,
                     },
                 },
-                Job::Stop => match spooler::stop_spooler(timeout) {
-                    Ok(status) => JobResult::Done {
-                        label: "Остановка",
-                        status,
-                        report: None,
-                    },
+                Job::Stop => match spooler::stop_spooler_on(&host, timeout) {
+                    Ok(status) => pack("Остановка", status, None),
                     Err(error) => JobResult::Failed {
                         label: "Остановка",
                         error,
                     },
                 },
-                Job::Start => match spooler::start_spooler(timeout) {
-                    Ok(status) => JobResult::Done {
-                        label: "Запуск",
-                        status,
-                        report: None,
-                    },
+                Job::Start => match spooler::start_spooler_on(&host, timeout) {
+                    Ok(status) => pack("Запуск", status, None),
                     Err(error) => JobResult::Failed {
                         label: "Запуск",
                         error,
                     },
                 },
-                Job::Restart => match spooler::restart_spooler(timeout) {
-                    Ok(status) => JobResult::Done {
-                        label: "Перезапуск",
-                        status,
-                        report: None,
-                    },
+                Job::Restart => match spooler::restart_spooler_on(&host, timeout) {
+                    Ok(status) => pack("Перезапуск", status, None),
                     Err(error) => JobResult::Failed {
                         label: "Перезапуск",
                         error,
                     },
                 },
-                Job::ClearOnly => match queue::clear_queue(timeout) {
-                    Ok((report, status)) => JobResult::Done {
-                        label: "Очистка очереди",
-                        status,
-                        report: Some(report),
-                    },
+                Job::ClearOnly => match queue::clear_queue_on(&host, timeout) {
+                    Ok((report, status)) => pack("Очистка очереди", status, Some(report)),
                     Err(error) => JobResult::Failed {
                         label: "Очистка очереди",
                         error,
                     },
                 },
-                Job::FixClear => match queue::fix_queue(timeout) {
-                    Ok((report, status)) => JobResult::Done {
-                        label: "Очистка и перезапуск",
-                        status,
-                        report: Some(report),
-                    },
+                Job::FixClear => match queue::fix_queue_on(&host, timeout) {
+                    Ok((report, status)) => pack("Очистка и перезапуск", status, Some(report)),
                     Err(error) => JobResult::Failed {
                         label: "Очистка и перезапуск",
                         error,
@@ -413,8 +460,10 @@ impl SpoolCtlApp {
                 label,
                 status,
                 report,
+                snap,
             }) => {
-                self.apply_status(&status);
+                self.apply_status_fields(&status);
+                self.apply_queue_snap(snap);
                 let had_failures = report.as_ref().is_some_and(|r| !r.failed.is_empty());
                 let left_stopped =
                     label == "Очистка очереди" && status.state == spooler::ServiceState::Stopped;
@@ -461,6 +510,7 @@ impl SpoolCtlApp {
             }
             Ok(JobResult::Failed { label, error }) => {
                 log::error(&format!("{label}: {error}"));
+                self.status_line = format!("служба печати недоступна — {}", self.host.label_ru());
                 self.message = format!("{label}: {error}");
                 self.message_is_error = true;
                 self.busy = false;
@@ -1013,6 +1063,63 @@ impl eframe::App for SpoolCtlApp {
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Удалённый ПК:")
+                            .size(16.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.host_input)
+                            .desired_width(380.0)
+                            .hint_text("например: 192.168.1.50 или OFFICE-PC"),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.apply_host_input();
+                    }
+                    resp.on_hover_text(
+                        "Формат: имя ПК (OFFICE-PC) или IPv4 (192.168.1.50).\n\
+                         Можно с \\\\ в начале. Пусто — этот компьютер.\n\
+                         Не указывайте путь, порт и http://",
+                    );
+                    if themed_button_bar(
+                        ui,
+                        [100.0, 30.0],
+                        "Применить",
+                        "Подключиться к указанному ПК через SCM (агент не нужен). Пустое поле — этот компьютер.",
+                        p.soft_btn,
+                        p.text,
+                    ) {
+                        self.apply_host_input();
+                    }
+                    if !self.host.is_local() {
+                        ui.label(
+                            RichText::new(format!("→ {}", self.host.name()))
+                                .size(14.0)
+                                .color(p.accent)
+                                .strong(),
+                        );
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Формат адреса: 192.168.1.50  ·  OFFICE-PC  ·  pc.firma.local   (пусто = этот ПК)",
+                    )
+                    .size(13.0)
+                    .color(p.accent),
+                );
+                if !self.host.is_local() {
+                    ui.label(
+                        RichText::new(
+                            "Сторож зависания работает только для этого ПК; кнопки ниже — для удалённого.",
+                        )
+                        .size(13.0)
+                        .color(p.text),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
                     ui.label(RichText::new("Права:").size(16.0).strong().color(p.text));
                     if self.elevated {
                         ui.label(
@@ -1029,15 +1136,53 @@ impl eframe::App for SpoolCtlApp {
                                 .strong(),
                         );
                         ui.add_space(10.0);
-                        if themed_button_bar(
-                            ui,
-                            [168.0, 30.0],
-                            "От админа",
-                            "Откроет окно UAC и перезапустит SpoolCtl с правами администратора. Нужно для остановки и перезапуска службы.",
-                            p.accent,
-                            p.on_accent,
-                        ) {
-                            self.request_admin_relaunch();
+                        // Статическая подсказка (было):
+                        // if themed_button_bar(
+                        //     ui,
+                        //     [168.0, 30.0],
+                        //     "От админа",
+                        //     "Откроет окно UAC и перезапустит SpoolCtl с правами администратора. Нужно для остановки и перезапуска службы.",
+                        //     p.accent,
+                        //     p.on_accent,
+                        // ) {
+                        //     self.request_admin_relaunch();
+                        // }
+                        {
+                            const ADMIN_TIP: &str = "Откроет окно UAC и перезапустит SpoolCtl с правами администратора. Нужно для остановки и перезапуска службы.";
+                            let resp = themed_button_bar_resp(
+                                ui,
+                                [168.0, 30.0],
+                                "От админа",
+                                p.accent,
+                                p.on_accent,
+                            );
+                            if resp.hovered() {
+                                let started =
+                                    self.admin_tip_started.get_or_insert_with(Instant::now);
+                                let chars = (started.elapsed().as_secs_f32() * 36.0) as usize;
+                                let shown = typewriter_prefix(ADMIN_TIP, chars);
+                                let tip_color = if ui.visuals().dark_mode {
+                                    Color32::from_rgb(235, 244, 255)
+                                } else {
+                                    Color32::from_rgb(18, 52, 86)
+                                };
+                                resp.show_tooltip_ui(|ui| {
+                                    ui.set_max_width(320.0);
+                                    ui.label(
+                                        RichText::new(shown)
+                                            .font(FontId::proportional(BUTTON_FONT_SIZE))
+                                            .color(tip_color),
+                                    );
+                                });
+                                if shown != ADMIN_TIP {
+                                    ui.ctx().request_repaint();
+                                }
+                            } else {
+                                self.admin_tip_started = None;
+                            }
+                            if resp.clicked() {
+                                self.request_admin_relaunch();
+                            }
                         }
                     }
                 });
@@ -1048,7 +1193,23 @@ impl eframe::App for SpoolCtlApp {
                         .size(20.0)
                         .color(p.accent)
                         .strong(),
+                )
+                .on_hover_text(
+                    "Как проверить, что SpoolCtl видит службу:\n\
+                     в командной строке от администратора:\n\
+                     sc stop Spooler  — здесь должно стать «остановлена»\n\
+                     sc start Spooler — снова «работает»\n\
+                     (это ручная проверка статуса, не автоперезапуск)",
                 );
+                if self.host.is_local() {
+                    ui.label(
+                        RichText::new(
+                            "Проверка: sc stop Spooler / sc start Spooler — статус выше должен смениться",
+                        )
+                        .size(13.0)
+                        .color(p.text),
+                    );
+                }
                 ui.label(RichText::new(&self.queue_line).size(16.0).color(p.text));
                 ui.add_space(6.0);
                 self.draw_watchdog_controls(ui, p);
@@ -1399,6 +1560,22 @@ fn themed_button_bar(
     } else {
         Color32::from_rgb(18, 52, 86)
     };
+    themed_button_bar_resp(ui, size, label, fill, text_color)
+        .on_hover_text(
+            RichText::new(tip)
+                .font(FontId::proportional(BUTTON_FONT_SIZE))
+                .color(tip_color),
+        )
+        .clicked()
+}
+
+fn themed_button_bar_resp(
+    ui: &mut egui::Ui,
+    size: [f32; 2],
+    label: &str,
+    fill: Color32,
+    text_color: Color32,
+) -> egui::Response {
     let text = RichText::new(label)
         .font(FontId::proportional(14.0))
         .color(text_color)
@@ -1410,12 +1587,13 @@ fn themed_button_bar(
             .corner_radius(BUTTON_CORNER)
             .wrap_mode(egui::TextWrapMode::Truncate),
     )
-    .on_hover_text(
-        RichText::new(tip)
-            .font(FontId::proportional(BUTTON_FONT_SIZE))
-            .color(tip_color),
-    )
-    .clicked()
+}
+
+fn typewriter_prefix(text: &str, n_chars: usize) -> &str {
+    match text.char_indices().nth(n_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
 }
 
 /// Compact service action: icon on top, short label below.

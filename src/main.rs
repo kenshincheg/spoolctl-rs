@@ -3,6 +3,7 @@
 mod autostart;
 mod elevate;
 mod gui;
+mod host;
 mod log;
 mod ncd;
 mod os;
@@ -153,14 +154,26 @@ fn ensure_cli_console() {
 }
 
 fn run_cli(args: &[String]) {
-    let command = args[0].as_str();
+    let (host, rest) = match parse_host_args(args) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    if rest.is_empty() {
+        eprintln!("Укажите команду после --host (например: status).");
+        eprintln!("Используйте: spoolctl help");
+        std::process::exit(2);
+    }
+    let command = rest[0].as_str();
     match command {
-        "status" | "--status" => run_status(),
-        "stop" => run_control("Остановка", spooler::stop_spooler),
-        "start" => run_control("Запуск", spooler::start_spooler),
-        "restart" => run_control("Перезапуск", spooler::restart_spooler),
-        "clear-queue" => run_clear(false),
-        "fix" => run_clear(true),
+        "status" | "--status" => run_status(&host),
+        "stop" => run_control(&host, "Остановка", spooler::stop_spooler_on),
+        "start" => run_control(&host, "Запуск", spooler::start_spooler_on),
+        "restart" => run_control(&host, "Перезапуск", spooler::restart_spooler_on),
+        "clear-queue" => run_clear(&host, false),
+        "fix" => run_clear(&host, true),
         "version" | "--version" | "-V" => print_version(),
         "help" | "--help" | "-h" => print_help(),
         other => {
@@ -171,11 +184,41 @@ fn run_cli(args: &[String]) {
     }
 }
 
-fn run_status() {
-    match spooler::query_spooler_status() {
+/// Splits `--host NAME` (or `/host`) from the rest of CLI args.
+fn parse_host_args(args: &[String]) -> Result<(host::Host, Vec<String>), String> {
+    let mut host = host::Host::local();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--host" || a == "/host" || a == "-H" {
+            let Some(value) = args.get(i + 1) else {
+                return Err("После --host нужно имя ПК или IP.".to_owned());
+            };
+            host = host::Host::parse(value)?;
+            i += 2;
+            continue;
+        }
+        if let Some(value) = a.strip_prefix("--host=") {
+            host = host::Host::parse(value)?;
+            i += 1;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    Ok((host, rest))
+}
+
+fn run_status(host: &host::Host) {
+    match spooler::query_spooler_status_on(host) {
         Ok(status) => {
-            log::info(&format!("Статус: {}", status.state.as_ru_str()));
-            print_status(&status);
+            log::info(&format!(
+                "Статус ({}): {}",
+                host.label_ru(),
+                status.state.as_ru_str()
+            ));
+            print_status(host, &status);
         }
         Err(error) => {
             log::error(&error);
@@ -185,14 +228,25 @@ fn run_status() {
     }
 }
 
-fn run_control(label: &str, action: fn(Duration) -> Result<spooler::SpoolerStatus, String>) {
-    println!("{label} службы печати (Spooler)...");
-    log::info(&format!("{label}: начало"));
-    match action(spooler::DEFAULT_CONTROL_TIMEOUT) {
+fn run_control(
+    host: &host::Host,
+    label: &str,
+    action: fn(&host::Host, Duration) -> Result<spooler::SpoolerStatus, String>,
+) {
+    println!(
+        "{label} службы печати (Spooler) на {}...",
+        host.label_ru()
+    );
+    log::info(&format!("{label} ({}): начало", host.label_ru()));
+    match action(host, spooler::DEFAULT_CONTROL_TIMEOUT) {
         Ok(status) => {
-            log::info(&format!("{label}: ок ({})", status.state.as_ru_str()));
+            log::info(&format!(
+                "{label} ({}): ок ({})",
+                host.label_ru(),
+                status.state.as_ru_str()
+            ));
             println!("{}", done_message_cli(label));
-            print_status(&status);
+            print_status(host, &status);
         }
         Err(error) => {
             log::error(&format!("{label}: {error}"));
@@ -211,31 +265,33 @@ fn done_message_cli(label: &str) -> String {
     format!("{label} {participle}.")
 }
 
-fn run_clear(restart_after: bool) {
+fn run_clear(host: &host::Host, restart_after: bool) {
     let label = if restart_after {
         "Очистка очереди и перезапуск"
     } else {
         "Очистка очереди"
     };
-    println!("{label}...");
-    log::info(&format!("{label}: начало"));
+    println!("{label} на {}...", host.label_ru());
+    log::info(&format!("{label} ({}): начало", host.label_ru()));
     let timeout = spooler::DEFAULT_CONTROL_TIMEOUT;
     let result = if restart_after {
-        queue::fix_queue(timeout)
+        queue::fix_queue_on(host, timeout)
     } else {
-        queue::clear_queue(timeout)
+        queue::clear_queue_on(host, timeout)
     };
     match result {
         Ok((report, status)) => {
             let summary = report.summary_ru();
             if report.failed.is_empty() {
                 log::info(&format!(
-                    "{label}: {summary}; служба «{}»",
+                    "{label} ({}): {summary}; служба «{}»",
+                    host.label_ru(),
                     status.state.as_ru_str()
                 ));
             } else {
                 log::warn(&format!(
-                    "{label}: {summary}; служба «{}»",
+                    "{label} ({}): {summary}; служба «{}»",
+                    host.label_ru(),
                     status.state.as_ru_str()
                 ));
             }
@@ -243,9 +299,16 @@ fn run_clear(restart_after: bool) {
             if !report.failed.is_empty() {
                 eprintln!("Предупреждение: часть файлов не удалена.");
             }
-            print_status(&status);
+            print_status(host, &status);
             if !restart_after {
-                println!("Spooler оставлен остановленным. Запуск: spoolctl start");
+                println!(
+                    "Spooler оставлен остановленным. Запуск: spoolctl --host {} start",
+                    if host.is_local() {
+                        "<этот ПК>".to_owned()
+                    } else {
+                        host.name().to_owned()
+                    }
+                );
             }
         }
         Err(error) => {
@@ -256,9 +319,13 @@ fn run_clear(restart_after: bool) {
     }
 }
 
-fn print_status(status: &spooler::SpoolerStatus) {
-    println!("Служба печати (Spooler): {}", status.state.as_ru_str());
-    let snap = queue::queue_snapshot();
+fn print_status(host: &host::Host, status: &spooler::SpoolerStatus) {
+    println!(
+        "ПК: {} | Служба печати (Spooler): {}",
+        host.label_ru(),
+        status.state.as_ru_str()
+    );
+    let snap = queue::queue_snapshot_on(host);
     println!("{}", snap.line_ru());
     if snap.printers.is_empty() {
         println!("Принтеры: нет или список недоступен");
@@ -297,6 +364,7 @@ fn print_help() {
     println!("  spoolctl              открыть графический интерфейс");
     println!("  spoolctl --tray       GUI сразу в системный трей");
     println!("  spoolctl status       показать статус Spooler");
+    println!("  spoolctl --host ПК status   статус на удалённом ПК (без агента)");
     println!("  spoolctl stop         остановить Spooler (нужен администратор)");
     println!("  spoolctl start        запустить Spooler (нужен администратор)");
     println!("  spoolctl restart      перезапустить Spooler (нужен администратор)");
@@ -304,6 +372,8 @@ fn print_help() {
     println!("  spoolctl fix          очистить очередь и перезапустить Spooler");
     println!("  spoolctl version      показать версию");
     println!("  spoolctl help         эта справка");
+    println!();
+    println!("Удалёнка: docs\\REMOTE.md — SCM + ADMIN$, агент на том ПК не нужен.");
     println!();
     println!("Журнал: рядом с EXE в logs\\spoolctl.log (или %LOCALAPPDATA%\\SpoolCtl\\logs).");
 }

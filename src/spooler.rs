@@ -1,5 +1,5 @@
 //! Print Spooler service helpers via Win32 Service Control Manager.
-//! Uses APIs available since Windows Vista/7.
+//! Uses APIs available since Windows Vista/7. Supports remote PC via SCM.
 
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,8 @@ use windows::{
     },
     core::PCWSTR,
 };
+
+use crate::host::Host;
 
 const SPOOLER_SERVICE_NAME: &str = "Spooler";
 
@@ -90,22 +92,32 @@ struct ServiceHandle {
 }
 
 impl ServiceHandle {
-    fn open_manager() -> Result<Self, String> {
-        // SAFETY: null machine/database opens the local SCM; rights are connect-only.
-        let handle = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-            .map_err(|err| map_scm_error("Не удалось открыть Service Control Manager", err))?;
+    fn open_manager(host: &Host) -> Result<Self, String> {
+        let machine_wide = host.scm_machine_wide();
+        let machine = machine_wide
+            .as_ref()
+            .map(|w| PCWSTR(w.as_ptr()))
+            .unwrap_or(PCWSTR::null());
+        // SAFETY: machine is NUL-terminated or null (local); database null = ServicesActive.
+        let handle = unsafe { OpenSCManagerW(machine, PCWSTR::null(), SC_MANAGER_CONNECT) }
+            .map_err(|err| {
+                map_scm_error("Не удалось открыть Service Control Manager", err, host)
+            })?;
         Ok(Self { handle })
     }
 
-    fn open_spooler(manager: &Self, access: u32) -> Result<Self, String> {
+    fn open_spooler(manager: &Self, access: u32, host: &Host) -> Result<Self, String> {
         let name = to_wide(SPOOLER_SERVICE_NAME);
         // SAFETY: manager handle is valid for this process; name is a NUL-terminated wide string.
         let handle = unsafe { OpenServiceW(manager.handle, PCWSTR(name.as_ptr()), access) }
             .map_err(|err| {
                 if err.code().0 as u32 == ERROR_SERVICE_DOES_NOT_EXIST.0 {
-                    "Служба печати Spooler не найдена на этой системе.".to_owned()
+                    format!(
+                        "Служба печати Spooler не найдена ({})",
+                        host.label_ru()
+                    )
                 } else {
-                    map_scm_error("Не удалось открыть службу Spooler", err)
+                    map_scm_error("Не удалось открыть службу Spooler", err, host)
                 }
             })?;
         Ok(Self { handle })
@@ -114,8 +126,13 @@ impl ServiceHandle {
     fn query_status(&self) -> Result<SpoolerStatus, String> {
         let mut status = SERVICE_STATUS::default();
         // SAFETY: service handle is valid; status is fully written by QueryServiceStatus on success.
-        unsafe { QueryServiceStatus(self.handle, &mut status) }
-            .map_err(|err| map_scm_error("Не удалось прочитать статус Spooler", err))?;
+        unsafe { QueryServiceStatus(self.handle, &mut status) }.map_err(|err| {
+            map_scm_error(
+                "Не удалось прочитать статус Spooler",
+                err,
+                &Host::local(),
+            )
+        })?;
 
         Ok(SpoolerStatus {
             state: ServiceState::from_raw(status.dwCurrentState),
@@ -136,15 +153,24 @@ impl Drop for ServiceHandle {
 
 /// Reads the current Spooler service status. Does not change system state.
 pub fn query_spooler_status() -> Result<SpoolerStatus, String> {
-    let manager = ServiceHandle::open_manager()?;
-    let service = ServiceHandle::open_spooler(&manager, SERVICE_QUERY_STATUS)?;
+    query_spooler_status_on(&Host::local())
+}
+
+pub fn query_spooler_status_on(host: &Host) -> Result<SpoolerStatus, String> {
+    let manager = ServiceHandle::open_manager(host)?;
+    let service = ServiceHandle::open_spooler(&manager, SERVICE_QUERY_STATUS, host)?;
     service.query_status()
 }
 
 /// Stops the Spooler service and waits until it is stopped (or already stopped).
 pub fn stop_spooler(timeout: Duration) -> Result<SpoolerStatus, String> {
-    let manager = ServiceHandle::open_manager()?;
-    let service = ServiceHandle::open_spooler(&manager, SERVICE_STOP | SERVICE_QUERY_STATUS)?;
+    stop_spooler_on(&Host::local(), timeout)
+}
+
+pub fn stop_spooler_on(host: &Host, timeout: Duration) -> Result<SpoolerStatus, String> {
+    let manager = ServiceHandle::open_manager(host)?;
+    let service =
+        ServiceHandle::open_spooler(&manager, SERVICE_STOP | SERVICE_QUERY_STATUS, host)?;
 
     let status = service.query_status()?;
     if status.state == ServiceState::Stopped {
@@ -154,15 +180,20 @@ pub fn stop_spooler(timeout: Duration) -> Result<SpoolerStatus, String> {
     let mut control_status = SERVICE_STATUS::default();
     // SAFETY: service opened with SERVICE_STOP; ControlService writes SERVICE_STATUS on success.
     unsafe { ControlService(service.handle, SERVICE_CONTROL_STOP, &mut control_status) }
-        .map_err(|err| map_scm_error("Не удалось остановить Spooler", err))?;
+        .map_err(|err| map_scm_error("Не удалось остановить Spooler", err, host))?;
 
     wait_until(&service, ServiceState::Stopped, timeout)
 }
 
 /// Starts the Spooler service and waits until it is running (or already running).
 pub fn start_spooler(timeout: Duration) -> Result<SpoolerStatus, String> {
-    let manager = ServiceHandle::open_manager()?;
-    let service = ServiceHandle::open_spooler(&manager, SERVICE_START | SERVICE_QUERY_STATUS)?;
+    start_spooler_on(&Host::local(), timeout)
+}
+
+pub fn start_spooler_on(host: &Host, timeout: Duration) -> Result<SpoolerStatus, String> {
+    let manager = ServiceHandle::open_manager(host)?;
+    let service =
+        ServiceHandle::open_spooler(&manager, SERVICE_START | SERVICE_QUERY_STATUS, host)?;
 
     let status = service.query_status()?;
     if status.state == ServiceState::Running {
@@ -173,34 +204,40 @@ pub fn start_spooler(timeout: Duration) -> Result<SpoolerStatus, String> {
     }
     if status.state != ServiceState::Stopped && status.state != ServiceState::Paused {
         return Err(format!(
-            "Нельзя запустить Spooler из состояния «{}».",
-            status.state.as_ru_str()
+            "Нельзя запустить Spooler из состояния «{}» ({}).",
+            status.state.as_ru_str(),
+            host.label_ru()
         ));
     }
 
     // SAFETY: service opened with SERVICE_START; no start args for Spooler.
     unsafe { StartServiceW(service.handle, None) }
-        .map_err(|err| map_scm_error("Не удалось запустить Spooler", err))?;
+        .map_err(|err| map_scm_error("Не удалось запустить Spooler", err, host))?;
 
     wait_until(&service, ServiceState::Running, timeout)
 }
 
 /// Restarts Spooler: stop (if needed) then start, waiting for each target state.
 pub fn restart_spooler(timeout: Duration) -> Result<SpoolerStatus, String> {
+    restart_spooler_on(&Host::local(), timeout)
+}
+
+pub fn restart_spooler_on(host: &Host, timeout: Duration) -> Result<SpoolerStatus, String> {
     let half = timeout / 2;
     let stop_timeout = if half.is_zero() { timeout } else { half };
     let start_timeout = timeout
         .saturating_sub(stop_timeout)
         .max(Duration::from_secs(1));
 
-    let after_stop = stop_spooler(stop_timeout)?;
+    let after_stop = stop_spooler_on(host, stop_timeout)?;
     if after_stop.state != ServiceState::Stopped {
         return Err(format!(
-            "После остановки ожидалось «остановлена», получено «{}».",
-            after_stop.state.as_ru_str()
+            "После остановки ожидалось «остановлена», получено «{}» ({}).",
+            after_stop.state.as_ru_str(),
+            host.label_ru()
         ));
     }
-    start_spooler(start_timeout)
+    start_spooler_on(host, start_timeout)
 }
 
 fn wait_until(
@@ -255,11 +292,41 @@ fn progress_window(wait_hint: Duration) -> Duration {
     wait_hint.max(Duration::from_secs(1))
 }
 
-fn map_scm_error(prefix: &str, err: windows::core::Error) -> String {
-    if err.code().0 as u32 == ERROR_ACCESS_DENIED.0 {
-        format!("{prefix}: отказано в доступе. Запустите от имени администратора.")
-    } else {
+fn map_scm_error(prefix: &str, err: windows::core::Error, host: &Host) -> String {
+    let code = win32_from_hresult(err.code().0 as u32);
+    if code == ERROR_ACCESS_DENIED.0 {
+        if host.is_local() {
+            format!("{prefix}: отказано в доступе. Запустите от имени администратора.")
+        } else {
+            format!(
+                "{prefix}: отказано в доступе к «{}». Нужны права администратора на том ПК и разрешённый удалённый SCM.",
+                host.label_ru()
+            )
+        }
+    } else if !host.is_local() && code == 1722 {
+        // RPC_S_SERVER_UNAVAILABLE
+        format!(
+            "{prefix}: ПК «{}» не отвечает по RPC (0x800706BA).\n\
+             Проверьте: ПК включён и в сети; брандмауэр — «Удалённое управление службами» \
+             (Remote Service Management); служба Remote Registry / RPC на том ПК; \
+             запуск SpoolCtl от имени администратора.",
+            host.label_ru()
+        )
+    } else if host.is_local() {
         format!("{prefix}: {err}")
+    } else {
+        format!(
+            "{prefix} («{}»): {err}. Сеть, имя/IP и брандмауэр (Remote Service Management).",
+            host.label_ru()
+        )
+    }
+}
+
+fn win32_from_hresult(hr: u32) -> u32 {
+    if hr & 0xFFFF_0000 == 0x8007_0000 {
+        hr & 0xFFFF
+    } else {
+        hr
     }
 }
 

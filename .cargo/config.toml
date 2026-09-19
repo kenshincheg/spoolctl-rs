@@ -1,3 +1,3 @@
-# Build artifacts on a local disk (not Google Drive / «Мой диск»).
+# Build 0.2.x (remote) on a separate local folder — keeps 0.1.15 artifacts intact.
 [build]
-target-dir = "E:/cargo-target/spoolctl-rs"
+target-dir = "E:/cargo-target/spoolctl-rs-0.2"

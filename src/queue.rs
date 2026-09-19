@@ -1,10 +1,12 @@
-//! Clear print queue files under `%SystemRoot%\System32\spool\PRINTERS`.
+//! Clear print queue files under `%SystemRoot%\System32\spool\PRINTERS`
+//! (or `\\host\ADMIN$\…` for a remote PC).
 //! Must only run while the Spooler service is stopped.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::host::Host;
 use crate::spooler::{self, ServiceState, SpoolerStatus};
 
 /// Result of deleting queue files (no file contents / secrets).
@@ -51,20 +53,22 @@ impl ClearReport {
     }
 }
 
-/// `%SystemRoot%\System32\spool\PRINTERS`
+/// `%SystemRoot%\System32\spool\PRINTERS` (local) or remote ADMIN$ path.
 pub fn printers_queue_dir() -> Result<PathBuf, String> {
-    let system_root = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("windir"))
-        .ok_or_else(|| "Не задана переменная SystemRoot.".to_owned())?;
-    Ok(PathBuf::from(system_root)
-        .join("System32")
-        .join("spool")
-        .join("PRINTERS"))
+    Host::local().printers_queue_dir()
+}
+
+pub fn printers_queue_dir_on(host: &Host) -> Result<PathBuf, String> {
+    host.printers_queue_dir()
 }
 
 /// Counts files in the PRINTERS directory (subfolders are ignored).
 pub fn queue_file_count() -> Result<usize, String> {
-    let dir = printers_queue_dir()?;
+    queue_file_count_on(&Host::local())
+}
+
+pub fn queue_file_count_on(host: &Host) -> Result<usize, String> {
+    let dir = printers_queue_dir_on(host)?;
     count_files_in(&dir)
 }
 
@@ -171,14 +175,18 @@ fn jobs_phrase(n: usize) -> String {
 
 /// Prefer Winspool job count; file count is secondary (needs folder ACL).
 pub fn queue_snapshot() -> QueueSnapshot {
-    let (jobs, printers) = match list_printers() {
+    queue_snapshot_on(&Host::local())
+}
+
+pub fn queue_snapshot_on(host: &Host) -> QueueSnapshot {
+    let (jobs, printers) = match list_printers_on(host) {
         Ok(list) => {
             let total = list.iter().map(|p| p.jobs).sum();
             (Some(total), list)
         }
         Err(_) => (None, Vec::new()),
     };
-    match queue_file_count() {
+    match queue_file_count_on(host) {
         Ok(files) => QueueSnapshot {
             jobs,
             files: Some(files),
@@ -234,6 +242,10 @@ fn count_files_in(dir: &Path) -> Result<usize, String> {
 
 /// Local and connection printers with current job counts (Winspool).
 pub fn list_printers() -> Result<Vec<PrinterEntry>, String> {
+    list_printers_on(&Host::local())
+}
+
+pub fn list_printers_on(host: &Host) -> Result<Vec<PrinterEntry>, String> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
@@ -244,15 +256,20 @@ pub fn list_printers() -> Result<Vec<PrinterEntry>, String> {
     use windows::core::{HRESULT, PCWSTR};
 
     let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+    let server_wide = host.winspool_server_wide();
+    let server = server_wide
+        .as_ref()
+        .map(|w| PCWSTR(w.as_ptr()))
+        .unwrap_or(PCWSTR::null());
     let mut needed = 0u32;
     let mut returned = 0u32;
 
-    // SAFETY: null name; first call probes buffer size.
+    // SAFETY: server null = local; first call probes buffer size.
     let probe =
-        unsafe { EnumPrintersW(flags, PCWSTR::null(), 4, None, &mut needed, &mut returned) };
+        unsafe { EnumPrintersW(flags, server, 4, None, &mut needed, &mut returned) };
     if let Err(error) = probe {
         if error.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
-            return Err(format!("EnumPrinters: {error}"));
+            return Err(format!("EnumPrinters ({}): {error}", host.label_ru()));
         }
     } else if needed == 0 {
         return Ok(Vec::new());
@@ -263,13 +280,13 @@ pub fn list_printers() -> Result<Vec<PrinterEntry>, String> {
     unsafe {
         EnumPrintersW(
             flags,
-            PCWSTR::null(),
+            server,
             4,
             Some(&mut buffer),
             &mut needed,
             &mut returned,
         )
-        .map_err(|error| format!("EnumPrinters: {error}"))?;
+        .map_err(|error| format!("EnumPrinters ({}): {error}", host.label_ru()))?;
     }
 
     let count = returned as usize;
@@ -290,7 +307,8 @@ pub fn list_printers() -> Result<Vec<PrinterEntry>, String> {
         };
         let attr_network = (info.Attributes & PRINTER_ATTRIBUTE_NETWORK) != 0;
 
-        let wide: Vec<u16> = std::ffi::OsStr::new(&name)
+        let open_name = host.printer_open_name(&name);
+        let wide: Vec<u16> = std::ffi::OsStr::new(&open_name)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
@@ -638,23 +656,38 @@ pub fn clear_queue_files(dir: &Path) -> Result<ClearReport, String> {
 
 /// Stops Spooler if needed, clears queue files, leaves Spooler stopped.
 pub fn clear_queue(timeout: Duration) -> Result<(ClearReport, SpoolerStatus), String> {
-    let status = spooler::stop_spooler(timeout)?;
+    clear_queue_on(&Host::local(), timeout)
+}
+
+pub fn clear_queue_on(
+    host: &Host,
+    timeout: Duration,
+) -> Result<(ClearReport, SpoolerStatus), String> {
+    let status = spooler::stop_spooler_on(host, timeout)?;
     if status.state != ServiceState::Stopped {
         return Err(format!(
-            "Spooler не остановлен (сейчас: «{}»). Очистка отменена.",
-            status.state.as_ru_str()
+            "Spooler не остановлен (сейчас: «{}», {}). Очистка отменена.",
+            status.state.as_ru_str(),
+            host.label_ru()
         ));
     }
-    let dir = printers_queue_dir()?;
+    let dir = printers_queue_dir_on(host)?;
     let report = clear_queue_files(&dir)?;
-    let status = spooler::query_spooler_status()?;
+    let status = spooler::query_spooler_status_on(host)?;
     Ok((report, status))
 }
 
 /// Stops Spooler, clears queue files, starts Spooler again.
 pub fn fix_queue(timeout: Duration) -> Result<(ClearReport, SpoolerStatus), String> {
-    let (report, _) = clear_queue(timeout)?;
-    let status = spooler::start_spooler(timeout)?;
+    fix_queue_on(&Host::local(), timeout)
+}
+
+pub fn fix_queue_on(
+    host: &Host,
+    timeout: Duration,
+) -> Result<(ClearReport, SpoolerStatus), String> {
+    let (report, _) = clear_queue_on(host, timeout)?;
+    let status = spooler::start_spooler_on(host, timeout)?;
     Ok((report, status))
 }
 
