@@ -11,6 +11,7 @@ use crate::elevate;
 use crate::host::Host;
 use crate::log;
 use crate::ncd;
+use crate::print_notify::{self, PrintNotify};
 use crate::queue::{self, ClearReport, PrinterEntry, QueueSnapshot};
 use crate::single_instance;
 use crate::spooler::{self, SpoolerStatus};
@@ -134,6 +135,8 @@ pub struct SpoolCtlApp {
     last_auto_status: Instant,
     ncd_summary: String,
     watchdog: Watchdog,
+    /// Balloon when a new print job appears (local, separate from hang watchdog).
+    print_notify: PrintNotify,
     /// Last known Spooler state for the hang watchdog.
     last_service_state: Option<spooler::ServiceState>,
     tray: Option<AppTray>,
@@ -181,6 +184,7 @@ impl SpoolCtlApp {
             last_auto_status: Instant::now(),
             ncd_summary: ncd::query_status().summary_ru(),
             watchdog: Watchdog::load(),
+            print_notify: PrintNotify::load(),
             last_service_state: None,
             tray: None,
             allow_exit: false,
@@ -209,6 +213,9 @@ impl SpoolCtlApp {
         }
         if app.watchdog.settings.auto_restart {
             log::info("Сторож зависания: автоперезапуск включён");
+        }
+        if app.print_notify.settings.notify_print_jobs {
+            log::info("Уведомления о печати: включены");
         }
         app.refresh_log_view();
         app.apply_status_query_local();
@@ -258,6 +265,7 @@ impl SpoolCtlApp {
             self.refresh_queue_line();
         }
         self.run_watchdog_tick();
+        self.run_print_notify_tick();
     }
 
     /// Parse the host field into `self.host`. Returns whether the target changed.
@@ -345,6 +353,21 @@ impl SpoolCtlApp {
                 self.start_job(Job::Restart);
             }
         }
+    }
+
+    fn run_print_notify_tick(&mut self) {
+        let newly = self.print_notify.poll_events();
+        if newly.is_empty() {
+            return;
+        }
+        let text = print_notify::message_ru(&newly);
+        // Balloon already shown by the watcher; refresh UI/log here.
+        if let Some(tray) = &self.tray {
+            tray.set_tooltip(&format!("SpoolCtl: {text}"));
+        }
+        self.message = text;
+        self.message_is_error = false;
+        self.refresh_log_view();
     }
 
     fn apply_status_query_local(&mut self) {
@@ -532,14 +555,18 @@ impl SpoolCtlApp {
         }
     }
 
-    fn request_admin_relaunch(&mut self) {
+    fn request_admin_relaunch(&mut self, ctx: &egui::Context) {
         log::info("Запрос запуска от имени администратора");
+        let pos = elevate::current_window_pos(ctx);
+        if let Some((x, y)) = pos {
+            log::info(&format!("UAC relaunch: сохраняем позицию окна ({x},{y})"));
+        }
         // Tear down tray host first so the elevated copy does not activate us / inherit a hidden state.
         self.tray = None;
         // Release single-instance mutex first; otherwise the elevated copy sees
         // this process still holding it, "activates" this closing window, and exits.
         single_instance::release_gui();
-        match elevate::relaunch_elevated() {
+        match elevate::relaunch_elevated(pos) {
             Ok(()) => {
                 log::info("UAC принят, закрытие текущего окна");
                 std::process::exit(0);
@@ -879,6 +906,46 @@ impl SpoolCtlApp {
                     .color(p.accent),
                 );
             }
+
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Уведомления о печати")
+                    .size(15.0)
+                    .strong()
+                    .color(p.text),
+            );
+            let mut notify = self.print_notify.settings.notify_print_jobs;
+            let notify_resp = ui.checkbox(
+                &mut notify,
+                "Сообщать, когда на принтер отправлено задание",
+            );
+            if notify_resp.changed() {
+                self.print_notify.set_enabled(notify);
+                log::info(&format!(
+                    "Уведомления о печати: {}",
+                    if notify { "вкл" } else { "выкл" }
+                ));
+                self.message = if notify {
+                    "Уведомления о печати включены (все локальные принтеры, слежение в фоне)."
+                        .to_owned()
+                } else {
+                    "Уведомления о печати выключены.".to_owned()
+                };
+                self.message_is_error = false;
+                self.refresh_log_view();
+            }
+            notify_resp.on_hover_text(
+                "Фоновое слежение: событие Spooler + опрос ~1 с. Balloon в трее с именем принтера. Не связано со сторожем зависания.",
+            );
+            if self.print_notify.settings.notify_print_jobs {
+                ui.label(
+                    RichText::new(
+                        "Слежение в фоне: все локальные принтеры (работает и из трея).",
+                    )
+                    .size(13.0)
+                    .color(p.accent),
+                );
+            }
         });
     }
 
@@ -969,6 +1036,9 @@ impl eframe::App for SpoolCtlApp {
         }
 
         self.poll_job(ctx);
+        if self.print_notify.settings.notify_print_jobs {
+            self.run_print_notify_tick();
+        }
         if self.busy || self.confirm.is_some() {
             return;
         }
@@ -1181,7 +1251,7 @@ impl eframe::App for SpoolCtlApp {
                                 self.admin_tip_started = None;
                             }
                             if resp.clicked() {
-                                self.request_admin_relaunch();
+                                self.request_admin_relaunch(ui.ctx());
                             }
                         }
                     }
@@ -1869,27 +1939,41 @@ fn done_message(label: &str) -> String {
 }
 
 pub fn run() -> eframe::Result {
-    run_inner(false, false)
+    run_inner(false, false, None)
+}
+
+/// Start GUI visible after UAC relaunch (`--show`), optionally at `--pos=x,y`.
+pub fn run_after_elevate(pos: Option<(f32, f32)>) -> eframe::Result {
+    run_inner(false, true, pos)
 }
 
 /// Start GUI and immediately hide to tray (Windows autostart / `--tray`).
 pub fn run_start_in_tray() -> eframe::Result {
-    run_inner(true, false)
+    run_inner(true, false, None)
 }
 
-/// Start GUI visible after UAC relaunch (`--show`).
-pub fn run_after_elevate() -> eframe::Result {
-    run_inner(false, true)
-}
-
-fn run_inner(start_in_tray: bool, force_show_window: bool) -> eframe::Result {
-    match run_with_renderer(eframe::Renderer::Glow, start_in_tray, force_show_window) {
+fn run_inner(
+    start_in_tray: bool,
+    force_show_window: bool,
+    window_pos: Option<(f32, f32)>,
+) -> eframe::Result {
+    match run_with_renderer(
+        eframe::Renderer::Glow,
+        start_in_tray,
+        force_show_window,
+        window_pos,
+    ) {
         Ok(()) => Ok(()),
         Err(glow_err) => {
             log::warn(&format!(
                 "OpenGL (Glow) недоступен: {glow_err}; пробуем DirectX/Vulkan (wgpu)"
             ));
-            match run_with_renderer(eframe::Renderer::Wgpu, start_in_tray, force_show_window) {
+            match run_with_renderer(
+                eframe::Renderer::Wgpu,
+                start_in_tray,
+                force_show_window,
+                window_pos,
+            ) {
                 Ok(()) => Ok(()),
                 Err(wgpu_err) => {
                     log::error(&format!("wgpu тоже не запустился: {wgpu_err}"));
@@ -1904,6 +1988,7 @@ fn run_with_renderer(
     renderer: eframe::Renderer,
     start_in_tray: bool,
     force_show_window: bool,
+    window_pos: Option<(f32, f32)>,
 ) -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/printer-icon.png")).ok();
 
@@ -1921,6 +2006,10 @@ fn run_with_renderer(
         .with_inner_size([1080.0, start_h])
         .with_min_inner_size([900.0, 560.0])
         .with_title(title);
+    if let Some((x, y)) = window_pos {
+        viewport = viewport.with_position([x, y]);
+        log::info(&format!("Позиция окна после UAC: ({x},{y})"));
+    }
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }

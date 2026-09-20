@@ -205,6 +205,11 @@ fn hang_key(hang: &HangKind, printers: &[PrinterEntry]) -> String {
 }
 
 fn settings_path() -> PathBuf {
+    settings_path_for_peers()
+}
+
+/// Shared path for `spoolctl-settings.txt` (watchdog + print_notify).
+pub fn settings_path_for_peers() -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
     {
@@ -259,11 +264,31 @@ fn save_settings(settings: &Settings) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let body = format!(
+    // Preserve keys owned by other modules (e.g. notify_print_jobs).
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut extras: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        match k.trim() {
+            "watch_enabled" | "watch" | "auto_restart" => {}
+            _ => extras.push(trimmed.to_owned()),
+        }
+    }
+    let mut body = format!(
         "# SpoolCtl settings\nwatch_enabled={}\nauto_restart={}\n",
         if settings.watch_enabled { "1" } else { "0" },
         if settings.auto_restart { "1" } else { "0" },
     );
+    for e in extras {
+        body.push_str(&e);
+        body.push('\n');
+    }
     let _ = fs::write(path, body);
 }
 

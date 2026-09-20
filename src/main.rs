@@ -7,6 +7,7 @@ mod host;
 mod log;
 mod ncd;
 mod os;
+mod print_notify;
 mod queue;
 mod single_instance;
 mod spooler;
@@ -31,6 +32,7 @@ fn main() {
     if args.is_empty() || is_gui_flag(&args) {
         let start_in_tray = is_tray_launch(&args);
         let after_elevate = is_show_launch(&args);
+        let window_pos = elevate::parse_pos_arg(&args);
         if !gui_supported() {
             notify_gui_unsupported();
             return;
@@ -54,7 +56,7 @@ fn main() {
         let result = if start_in_tray {
             gui::run_start_in_tray()
         } else if after_elevate {
-            gui::run_after_elevate()
+            gui::run_after_elevate(window_pos)
         } else {
             gui::run()
         };
@@ -73,7 +75,9 @@ fn main() {
 }
 
 fn is_gui_flag(args: &[String]) -> bool {
-    is_tray_launch(args) || is_show_launch(args)
+    is_tray_launch(args)
+        || is_show_launch(args)
+        || args.iter().any(|a| a.starts_with("--pos="))
 }
 
 fn is_tray_launch(args: &[String]) -> bool {

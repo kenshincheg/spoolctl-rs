@@ -116,18 +116,23 @@ impl AppTray {
     }
 
     pub fn balloon(&self, title: &str, body: &str) {
-        let hwnd = tray_hwnd();
-        if hwnd.0.is_null() {
-            return;
-        }
-        let mut nid = base_nid(hwnd);
-        nid.uFlags = NIF_INFO | NIF_SHOWTIP;
-        write_wide(&mut nid.szInfoTitle, title);
-        write_wide(&mut nid.szInfo, body);
-        nid.dwInfoFlags = NIIF_INFO;
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-        }
+        balloon_now(title, body);
+    }
+}
+
+/// Show a balloon using the tray host HWND (safe to call from other threads for NIM_MODIFY).
+pub fn balloon_now(title: &str, body: &str) {
+    let hwnd = tray_hwnd();
+    if hwnd.0.is_null() {
+        return;
+    }
+    let mut nid = base_nid(hwnd);
+    nid.uFlags = NIF_INFO | NIF_SHOWTIP;
+    write_wide(&mut nid.szInfoTitle, title);
+    write_wide(&mut nid.szInfo, body);
+    nid.dwInfoFlags = NIIF_INFO;
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
 

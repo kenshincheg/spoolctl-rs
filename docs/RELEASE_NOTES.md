@@ -1,3 +1,27 @@
+# SpoolCtl — заметки к выпускам
+
+## 0.2.0 (линия remote, 2026-09-20)
+
+Portable для **Windows 10 / 11 x64** + папка `Windows7-CLI`.  
+Не затирает стабильную **0.1.15** (`dist\stage\`).
+
+### Новое относительно 0.1.15
+
+- **Удалённый ПК** — поле хоста / CLI `--host` (SCM без агента); см. `REMOTE.md`
+- **Уведомления о печати** — галочка: balloon при новом задании на локальный принтер (фон: Spooler `ADD_JOB` + опрос 1 с)
+- **UAC «От админа…»** — новое окно на том же мониторе (`--show --pos=x,y`)
+
+### Сборка
+
+```bat
+tools\build-portable-0.2.cmd
+```
+
+Артефакты: `dist\stage-0.2\`, `dist\SpoolCtl-0.2.0-win64.zip` (+ `.sha256`).  
+Копия для других ПК: `E:\my_project\rust_project\SpoolCtl-for-other-PCs\SpoolCtl-0.2.0-remote\`
+
+---
+
 # SpoolCtl 0.1.15 (стабильный выпуск)
 
 Portable-утилита для службы печати Windows (Spooler).
